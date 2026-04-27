@@ -10,18 +10,18 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Configuração MSSQL baseada nos dados fornecidos
+// Configuração MSSQL
 const dbConfig = {
     user: process.env.DB_USER || 'adminsql',
     password: process.env.DB_PASS || process.env.DB_PASSWORD || 'Xaviera%%',
-    server: process.env.DB_HOST || 'configurador-produto-sql.database.windows.net', // Nome do servidor Azure SQL
+    server: process.env.DB_HOST || 'configurador-produto-sql.database.windows.net',
     database: process.env.DB_NAME || 'configurador-produto',
     options: {
         encrypt: true,
         trustServerCertificate: false
     },
     pool: {
-        max: 5,
+        max: 10,
         min: 0,
         idleTimeoutMillis: 30000
     }
@@ -41,92 +41,306 @@ async function startServer() {
         console.log('>> Sucesso: Conectado ao Azure SQL Server (MSSQL)');
     } catch (err: any) {
         console.error('>> ERRO AO CONECTAR AO AZURE SQL SERVER:', err.message);
-        if (err.message.includes('paused')) {
-            console.warn('>> ATENÇÃO: O banco de dados está pausado (Cota Mensal atingida).');
-        }
     }
+
+    // --- DATABASE SETUP (Ensure tables exist) ---
+    const ensureTables = async () => {
+        if (!pool?.connected) return;
+        try {
+            // Ensure Notes column in Orders
+            await pool.request().query("IF COL_LENGTH('Orders', 'Notes') IS NULL ALTER TABLE Orders ADD Notes NVARCHAR(MAX)");
+            
+            // Ensure profiles table exists or map to 'usuarios'
+            // Since there is already 'usuarios', let's stick to it.
+        } catch (err: any) {
+            console.error("Setup error:", err.message);
+        }
+    };
+    await ensureTables();
+
+    // --- HELPER MAPPERS ---
+    
+    const mapProduct = (p: any) => ({
+        id: p.ProductID || p.id,
+        code: p.ProductCode || p.codigo,
+        description: p.ProductName || p.nome,
+        reference: p.ProductCode || p.codigo,
+        colors: [],
+        imageUrl: p.ImageData || '',
+        category: p.Category || p.tipo || 'Geral',
+        subcategory: '',
+        line: p.Line || '',
+        details: p.TechnicalSpecs || '',
+        amperage: ''
+    });
+
+    const mapUser = (u: any) => ({
+        id: u.id.toString(),
+        email: u.email,
+        name: u.nome || u.name,
+        role: u.perfil || u.role || 'REPRESENTATIVE'
+    });
 
     // --- API ROUTES ---
     
     app.get("/api/health", async (req, res) => {
-        const status = {
-            database: 'Microsoft SQL Server',
-            connected: pool?.connected || false,
-            error: null as string | null
-        };
+        const status = { database: 'MSSQL', connected: !!pool?.connected, error: null as string | null };
         if (pool?.connected) {
             try { await pool.request().query('SELECT 1'); } 
             catch (err: any) { status.error = err.message; }
         } else {
-            status.error = "Servidor SQL desconectado ou pausado.";
+            status.error = "Offline";
         }
         res.json(status);
     });
 
+    // PRODUCTS
     app.get("/api/products", async (req, res) => {
-        if (!pool?.connected) return res.status(503).json({ error: "Banco de dados pausado ou offline." });
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
         try {
-            const result = await pool.request().query('SELECT * FROM products ORDER BY description');
-            res.json(result.recordset);
-        } catch (err) {
-            console.error("DB Error:", err);
-            res.status(500).json({ error: "Erro ao buscar produtos" });
+            const result = await pool.request().query('SELECT * FROM Products ORDER BY ProductName');
+            res.json(result.recordset.map(mapProduct));
+        } catch (err: any) {
+            console.error("DB Error:", err.message);
+            res.status(500).json({ error: err.message });
         }
     });
 
+    app.post("/api/products", async (req, res) => {
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
+        const { code, description, category, line, details, imageUrl } = req.body;
+        try {
+            const result = await pool.request()
+                .input('code', sql.NVarChar, code)
+                .input('name', sql.NVarChar, description)
+                .input('category', sql.NVarChar, category)
+                .input('line', sql.NVarChar, line)
+                .input('specs', sql.NVarChar, details)
+                .input('image', sql.NVarChar, imageUrl)
+                .query(`INSERT INTO Products (ProductID, ProductCode, ProductName, Category, Line, TechnicalSpecs, ImageData, CreatedAt) 
+                        OUTPUT INSERTED.* 
+                        VALUES (NEWID(), @code, @name, @category, @line, @specs, @image, SYSDATETIMEOFFSET())`);
+            res.json(mapProduct(result.recordset[0]));
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.put("/api/products/:id", async (req, res) => {
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
+        const { code, description, category, line, details, imageUrl } = req.body;
+        try {
+            const result = await pool.request()
+                .input('id', sql.UniqueIdentifier, req.params.id)
+                .input('code', sql.NVarChar, code)
+                .input('name', sql.NVarChar, description)
+                .input('category', sql.NVarChar, category)
+                .input('line', sql.NVarChar, line)
+                .input('specs', sql.NVarChar, details)
+                .input('image', sql.NVarChar, imageUrl)
+                .query(`UPDATE Products 
+                        SET ProductCode = @code, ProductName = @name, Category = @category, Line = @line, 
+                            TechnicalSpecs = @specs, ImageData = @image 
+                        OUTPUT INSERTED.*
+                        WHERE ProductID = @id`);
+            res.json(mapProduct(result.recordset[0]));
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // AUTH
     app.post("/api/auth/login", async (req, res) => {
         const { email, password } = req.body;
         const normalizedEmail = email?.toLowerCase().trim();
         
-        // Login Admin Mestre (Fallback se o DB estiver pausado)
         if (normalizedEmail === 'admin@dicompel.com.br' && password === 'Sigilo!@#2025') {
             return res.json({ id: '999', email: normalizedEmail, name: 'Admin Master', role: 'ADMIN' });
         }
 
-        if (!pool?.connected) return res.status(503).json({ error: "Banco offline. Use credenciais mestre." });
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
         
         try {
             const result = await pool.request()
                 .input('email', sql.NVarChar, normalizedEmail)
                 .input('password', sql.NVarChar, password)
-                .query('SELECT * FROM profiles WHERE email = @email AND password = @password');
+                .query('SELECT * FROM usuarios WHERE email = @email AND senha_hash = @password');
                 
             if (result.recordset.length > 0) {
-                const user = result.recordset[0];
-                res.json({ id: user.id, email: user.email, name: user.name, role: user.role });
+                return res.json(mapUser(result.recordset[0]));
             } else {
                 res.status(401).json({ error: "Credenciais inválidas" });
             }
-        } catch (err) {
-            res.status(500).json({ error: "Erro na autenticação" });
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
         }
     });
 
+    // USERS
     app.get("/api/users", async (req, res) => {
-        if (!pool?.connected) return res.status(503).json({ error: "DB offline" });
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
         try {
-            const result = await pool.request().query('SELECT id, email, name, role FROM profiles ORDER BY name');
-            res.json(result.recordset);
-        } catch (err) {
-            res.status(500).json({ error: "Erro ao buscar usuários" });
+            const result = await pool.request().query('SELECT * FROM usuarios ORDER BY nome');
+            res.json(result.recordset.map(mapUser));
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
         }
     });
 
     app.post("/api/users", async (req, res) => {
-        if (!pool?.connected) return res.status(503).json({ error: "DB offline" });
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
         const { name, email, role, password } = req.body;
         try {
             const result = await pool.request()
-                .input('name', sql.NVarChar, name)
+                .input('nome', sql.NVarChar, name)
                 .input('email', sql.NVarChar, email)
-                .input('role', sql.NVarChar, role)
-                .input('password', sql.NVarChar, password)
-                .query('INSERT INTO profiles (name, email, role, password) OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role VALUES (@name, @email, @role, @password)');
-            res.json(result.recordset[0]);
-        } catch (err) {
-            res.status(500).json({ error: "Erro ao criar usuário" });
+                .input('perfil', sql.NVarChar, role)
+                .input('senha_hash', sql.NVarChar, password)
+                .query('INSERT INTO usuarios (nome, email, perfil, senha_hash, ativo, criado_em) OUTPUT INSERTED.* VALUES (@nome, @email, @perfil, @password, 1, GETDATE())');
+            res.json(mapUser(result.recordset[0]));
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
         }
     });
+
+    app.put("/api/users/:id", async (req, res) => {
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
+        const { name, email, role } = req.body;
+        try {
+            const result = await pool.request()
+                .input('id', sql.Int, parseInt(req.params.id))
+                .input('nome', sql.NVarChar, name)
+                .input('email', sql.NVarChar, email)
+                .input('perfil', sql.NVarChar, role)
+                .query('UPDATE usuarios SET nome = @nome, email = @email, perfil = @perfil OUTPUT INSERTED.* WHERE id = @id');
+            res.json(mapUser(result.recordset[0]));
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.delete("/api/users/:id", async (req, res) => {
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
+        try {
+            await pool.request().input('id', sql.Int, parseInt(req.params.id)).query('DELETE FROM usuarios WHERE id = @id');
+            res.status(204).end();
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // ORDERS
+    const fetchOrdersWithItems = async (query: string, inputs: any[] = []) => {
+        if (!pool?.connected) return [];
+        const request = pool.request();
+        inputs.forEach(i => request.input(i.name, i.type, i.value));
+        const res = await request.query(query);
+        const orders = res.recordset;
+        
+        for (const order of orders) {
+            const itemsRes = await pool.request()
+                .input('orderId', sql.UniqueIdentifier, order.OrderID)
+                .query('SELECT ProductID as id, ProductCode as code, ProductName as description, Quantity as quantity FROM OrderItems WHERE OrderID = @orderId');
+            order.items = itemsRes.recordset;
+            order.id = order.OrderID;
+            order.createdAt = order.CreatedAt;
+            order.status = order.Status;
+            order.representativeId = order.RepresentativeID;
+            order.customerName = order.CustomerName;
+            order.customerEmail = order.CustomerEmail;
+            order.customerContact = order.CustomerPhone;
+        }
+        return orders;
+    };
+
+    app.get("/api/orders", async (req, res) => {
+        try {
+            const orders = await fetchOrdersWithItems('SELECT * FROM Orders ORDER BY CreatedAt DESC');
+            res.json(orders);
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.get("/api/orders/rep/:repId", async (req, res) => {
+        try {
+            const orders = await fetchOrdersWithItems(
+                'SELECT * FROM Orders WHERE RepresentativeID = @repId ORDER BY CreatedAt DESC',
+                [{ name: 'repId', type: sql.NVarChar, value: req.params.repId }]
+            );
+            res.json(orders);
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.post("/api/orders", async (req, res) => {
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
+        const { customerName, customerEmail, customerContact, representativeId, items, status, notes } = req.body;
+        
+        const transaction = new sql.Transaction(pool);
+        try {
+            await transaction.begin();
+            const orderRequest = new sql.Request(transaction);
+            
+            const orderResult = await orderRequest
+                .input('name', sql.NVarChar, customerName || '')
+                .input('email', sql.NVarChar, customerEmail || '')
+                .input('phone', sql.NVarChar, customerContact || '')
+                .input('repId', sql.NVarChar, representativeId)
+                .input('status', sql.NVarChar, status || 'Novo')
+                .input('notes', sql.NVarChar, notes || '')
+                .query(`INSERT INTO Orders (OrderID, CustomerName, CustomerEmail, CustomerPhone, RepresentativeID, Status, CreatedAt, OrderNumber, Notes) 
+                        OUTPUT INSERTED.* 
+                        VALUES (NEWID(), @name, @email, @phone, @repId, @status, SYSDATETIMEOFFSET(), LEFT(REPLACE(CAST(NEWID() as nvarchar(max)), '-', ''), 8), @notes)`);
+            
+            const newOrder = orderResult.recordset[0];
+            
+            for (const item of items) {
+                const itemRequest = new sql.Request(transaction);
+                await itemRequest
+                    .input('orderId', sql.UniqueIdentifier, newOrder.OrderID)
+                    .input('prodId', sql.UniqueIdentifier, item.id)
+                    .input('code', sql.NVarChar, item.code)
+                    .input('name', sql.NVarChar, item.description)
+                    .input('qty', sql.Int, item.quantity)
+                    .query('INSERT INTO OrderItems (OrderItemID, OrderID, ProductID, ProductCode, ProductName, Quantity) VALUES (NEWID(), @orderId, @prodId, @code, @name, @qty)');
+            }
+            
+            await transaction.commit();
+            res.json({ ...newOrder, id: newOrder.OrderID, items });
+        } catch (err: any) {
+            await transaction.rollback();
+            console.error("Order Error:", err.message);
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.patch("/api/orders/:id/status", async (req, res) => {
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
+        try {
+            await pool.request()
+                .input('id', sql.UniqueIdentifier, req.params.id)
+                .input('status', sql.NVarChar, req.body.status)
+                .query('UPDATE Orders SET Status = @status WHERE OrderID = @id');
+            res.status(204).end();
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.delete("/api/orders/:id", async (req, res) => {
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
+        try {
+            // Delete items first
+            await pool.request().input('id', sql.UniqueIdentifier, req.params.id).query('DELETE FROM OrderItems WHERE OrderID = @id');
+            await pool.request().input('id', sql.UniqueIdentifier, req.params.id).query('DELETE FROM Orders WHERE OrderID = @id');
+            res.status(204).end();
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
 
     // --- VITE MIDDLEWARE ---
     if (process.env.NODE_ENV !== "production") {

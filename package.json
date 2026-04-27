@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "start": "tsx server.ts"
+    "start": "node --loader tsx server.ts"
   },
   "dependencies": {
     "@google/genai": "^1.34.0",

@@ -61,19 +61,22 @@ async function startServer() {
 
     // --- HELPER MAPPERS ---
     
-    const mapProduct = (p: any) => ({
-        id: p.ProductID || p.id,
-        code: p.ProductCode || p.codigo,
-        description: p.ProductName || p.nome,
-        reference: p.ProductCode || p.codigo,
-        colors: [],
-        imageUrl: p.ImageData || '',
-        category: p.Category || p.tipo || 'Geral',
-        subcategory: '',
-        line: p.Line || '',
-        details: p.TechnicalSpecs || '',
-        amperage: ''
-    });
+    const mapProduct = (p: any) => {
+        const product = {
+            id: p.ProductID || p.id,
+            code: p.ProductCode || p.codigo,
+            description: p.ProductName || p.nome || p.description, // Fallback if column happens to be named description
+            reference: p.ProductCode || p.codigo,
+            colors: [],
+            imageUrl: p.ImageData || '',
+            category: p.Category || p.tipo || 'Geral',
+            subcategory: '',
+            line: p.Line || '',
+            details: p.TechnicalSpecs || '',
+            amperage: ''
+        };
+        return product;
+    };
 
     const mapUser = (u: any) => {
         let role = (u.perfil || u.role || 'REPRESENTATIVE').toUpperCase();
@@ -86,10 +89,27 @@ async function startServer() {
         };
     };
 
+    // --- LOGGING HELPER ---
+    const executeQuery = async (query: string, params: {name: string, type: any, value: any}[] = []) => {
+        console.log(`[SQL] Executing: ${query.substring(0, 100)}${query.length > 100 ? '...' : ''}`);
+        if (!pool?.connected) throw new Error("Database not connected");
+        const request = pool.request();
+        params.forEach(p => request.input(p.name, p.type, p.value));
+        return request.query(query);
+    };
+
     // --- API ROUTES ---
     
     app.get("/api/health", async (req, res) => {
-        const status = { database: 'MSSQL', connected: !!pool?.connected, error: null as string | null };
+        const status = { 
+            database: 'MSSQL', 
+            connected: !!pool?.connected, 
+            error: null as string | null,
+            env: {
+                DATABASE_SERVER: process.env.DATABASE_SERVER ? 'SET' : 'MISSING',
+                DATABASE_USER: process.env.DATABASE_USER ? 'SET' : 'MISSING'
+            }
+        };
         if (pool?.connected) {
             try { await pool.request().query('SELECT 1'); } 
             catch (err: any) { status.error = err.message; }
@@ -99,11 +119,24 @@ async function startServer() {
         res.json(status);
     });
 
-    // PRODUCTS
-    app.get("/api/products", async (req, res) => {
+    // DB DIAGNOSTIC
+    app.get("/api/db/diagnose/:table", async (req, res) => {
         if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
         try {
-            const result = await pool.request().query('SELECT * FROM Products ORDER BY ProductName');
+            const table = req.params.table;
+            const result = await pool.request()
+                .input('table', sql.NVarChar, table)
+                .query("SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @table");
+            res.json(result.recordset);
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // PRODUCTS
+    app.get("/api/products", async (req, res) => {
+        try {
+            const result = await executeQuery('SELECT * FROM Products ORDER BY ProductName');
             res.json(result.recordset.map(mapProduct));
         } catch (err: any) {
             console.error("DB Error:", err.message);
@@ -234,6 +267,19 @@ async function startServer() {
         }
     });
 
+    app.patch("/api/users/:id/password", async (req, res) => {
+        if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
+        try {
+            await pool.request()
+                .input('id', sql.Int, parseInt(req.params.id))
+                .input('password', sql.NVarChar, req.body.password)
+                .query('UPDATE usuarios SET senha_hash = @password WHERE id = @id');
+            res.status(204).end();
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
     // ORDERS
     const fetchOrdersWithItems = async (query: string, inputs: any[] = []) => {
         if (!pool?.connected) return [];
@@ -245,8 +291,11 @@ async function startServer() {
         for (const order of orders) {
             const itemsRes = await pool.request()
                 .input('orderId', sql.UniqueIdentifier, order.OrderID)
-                .query('SELECT ProductID as id, ProductCode as code, ProductName as description, Quantity as quantity FROM OrderItems WHERE OrderID = @orderId');
-            order.items = itemsRes.recordset;
+                .query('SELECT ProductID as id, ProductCode as code, ProductName as pName, Quantity as quantity FROM OrderItems WHERE OrderID = @orderId');
+            order.items = itemsRes.recordset.map((it: any) => ({
+                ...it,
+                description: it.pName
+            }));
             order.id = order.OrderID;
             order.createdAt = order.CreatedAt;
             order.status = order.Status;

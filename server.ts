@@ -29,10 +29,19 @@ const dbConfig = {
 
 async function startServer() {
     const app = express();
-    // Prioriza PORT (padrão Azure), depois WEBSITES_PORT (configurado pelo usuário), e 3000 como fallback
-    const PORT = process.env.PORT || process.env.WEBSITES_PORT || 3000;
+    // Prioriza WEBSITES_PORT se definido manualmente no Portal Azure, senão usa PORT padrão.
+    const PORT = process.env.WEBSITES_PORT || process.env.PORT || 3000;
 
     app.use(express.json());
+
+    // FaviIcon bypass
+    app.get("/favicon.ico", (req, res) => res.status(204).end());
+
+    // --- LOGS DE INICIALIZAÇÃO PARA DIAGNÓSTICO ---
+    console.log(`>> [INFO] Iniciando servidor...`);
+    console.log(`>> [INFO] Porta detectada: ${PORT}`);
+    console.log(`>> [INFO] Node Env: ${process.env.NODE_ENV}`);
+    console.log(`>> [INFO] DB Server: ${process.env.DATABASE_SERVER || process.env.DB_HOST}`);
 
     // Pool de conexão
     let pool: sql.ConnectionPool | null = null;
@@ -81,12 +90,21 @@ async function startServer() {
     const mapUser = (u: any) => {
         let role = (u.perfil || u.role || 'REPRESENTATIVE').toUpperCase();
         if (role === 'VENDEDOR') role = 'REPRESENTATIVE';
+        if (role === 'ADMIN') role = 'ADMIN';
         return {
             id: u.id.toString(),
             email: u.email,
             name: u.nome || u.name,
             role: role
         };
+    };
+
+    // Mapeia Role do Frontend para Perfil do Banco
+    const mapRoleToProfile = (role: string) => {
+        const r = role.toUpperCase();
+        if (r === 'REPRESENTATIVE') return 'vendedor';
+        if (r === 'ADMIN') return 'admin';
+        return 'vendedor'; // default
     };
 
     // --- LOGGING HELPER ---
@@ -228,11 +246,12 @@ async function startServer() {
     app.post("/api/users", async (req, res) => {
         if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
         const { name, email, role, password } = req.body;
+        const profile = mapRoleToProfile(role);
         try {
             const result = await pool.request()
                 .input('nome', sql.NVarChar, name)
                 .input('email', sql.NVarChar, email)
-                .input('perfil', sql.NVarChar, role)
+                .input('perfil', sql.NVarChar, profile)
                 .input('senha_hash', sql.NVarChar, password)
                 .query('INSERT INTO usuarios (nome, email, perfil, senha_hash, ativo, criado_em) OUTPUT INSERTED.* VALUES (@nome, @email, @perfil, @senha_hash, 1, GETDATE())');
             res.json(mapUser(result.recordset[0]));
@@ -244,12 +263,13 @@ async function startServer() {
     app.put("/api/users/:id", async (req, res) => {
         if (!pool?.connected) return res.status(503).json({ error: "DB Offline" });
         const { name, email, role } = req.body;
+        const profile = mapRoleToProfile(role);
         try {
             const result = await pool.request()
                 .input('id', sql.Int, parseInt(req.params.id))
                 .input('nome', sql.NVarChar, name)
                 .input('email', sql.NVarChar, email)
-                .input('perfil', sql.NVarChar, role)
+                .input('perfil', sql.NVarChar, profile)
                 .query('UPDATE usuarios SET nome = @nome, email = @email, perfil = @perfil OUTPUT INSERTED.* WHERE id = @id');
             res.json(mapUser(result.recordset[0]));
         } catch (err: any) {

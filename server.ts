@@ -29,7 +29,7 @@ const dbConfig = {
 
 async function startServer() {
     const app = express();
-    const PORT = 3000;
+    const PORT = process.env.PORT || 3000;
 
     app.use(express.json());
 
@@ -74,12 +74,16 @@ async function startServer() {
         amperage: ''
     });
 
-    const mapUser = (u: any) => ({
-        id: u.id.toString(),
-        email: u.email,
-        name: u.nome || u.name,
-        role: u.perfil || u.role || 'REPRESENTATIVE'
-    });
+    const mapUser = (u: any) => {
+        let role = (u.perfil || u.role || 'REPRESENTATIVE').toUpperCase();
+        if (role === 'VENDEDOR') role = 'REPRESENTATIVE';
+        return {
+            id: u.id.toString(),
+            email: u.email,
+            name: u.nome || u.name,
+            role: role
+        };
+    };
 
     // --- API ROUTES ---
     
@@ -196,7 +200,7 @@ async function startServer() {
                 .input('email', sql.NVarChar, email)
                 .input('perfil', sql.NVarChar, role)
                 .input('senha_hash', sql.NVarChar, password)
-                .query('INSERT INTO usuarios (nome, email, perfil, senha_hash, ativo, criado_em) OUTPUT INSERTED.* VALUES (@nome, @email, @perfil, @password, 1, GETDATE())');
+                .query('INSERT INTO usuarios (nome, email, perfil, senha_hash, ativo, criado_em) OUTPUT INSERTED.* VALUES (@nome, @email, @perfil, @senha_hash, 1, GETDATE())');
             res.json(mapUser(result.recordset[0]));
         } catch (err: any) {
             res.status(500).json({ error: err.message });
@@ -358,7 +362,7 @@ async function startServer() {
     }
 
     app.listen(PORT, "0.0.0.0", () => {
-        console.log(`Servidor rodando em http://localhost:${PORT}`);
+        console.log(`Servidor rodando em porta ${PORT}`);
     });
 }
 

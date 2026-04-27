@@ -12,10 +12,10 @@ const __dirname = path.dirname(__filename);
 
 // Configuração MSSQL
 const dbConfig = {
-    user: process.env.DB_USER || 'adminsql',
-    password: process.env.DB_PASS || process.env.DB_PASSWORD || 'Xaviera%%',
-    server: process.env.DB_HOST || 'configurador-produto-sql.database.windows.net',
-    database: process.env.DB_NAME || 'configurador-produto',
+    user: process.env.DATABASE_USER || process.env.DB_USER || 'adminsql',
+    password: process.env.DATABASE_PASSWORD || process.env.DB_PASS || process.env.DB_PASSWORD || 'Xaviera%%',
+    server: process.env.DATABASE_SERVER || process.env.DB_HOST || 'configurador-produto-sql.database.windows.net',
+    database: process.env.DATABASE_NAME || process.env.DB_NAME || 'configurador-produto',
     options: {
         encrypt: true,
         trustServerCertificate: false
@@ -29,7 +29,8 @@ const dbConfig = {
 
 async function startServer() {
     const app = express();
-    const PORT = process.env.PORT || 3000;
+    // Prioriza PORT (padrão Azure), depois WEBSITES_PORT (configurado pelo usuário), e 3000 como fallback
+    const PORT = process.env.PORT || process.env.WEBSITES_PORT || 3000;
 
     app.use(express.json());
 
